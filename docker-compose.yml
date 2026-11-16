@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: exporter
+      POSTGRES_PASSWORD: exporter
+      POSTGRES_DB: source
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U exporter -d source"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  app:
+    build: ./app
+    environment:
+      DATABASE_URL: postgresql://exporter:exporter@db:5432/source
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    ports:
+      - "8000:8000"
+
+  writer:
+    build: ./writer
+    environment:
+      DATABASE_URL: postgresql://exporter:exporter@db:5432/source
+    depends_on:
+      db:
+        condition: service_healthy
