@@ -1,10 +1,11 @@
 """FastAPI export service: referential-subset exporter for PostgreSQL.
 
 Endpoints:
-  GET  /healthz      liveness probe
-  GET  /api/tables   describe the exportable source schema
-  POST /api/export   export a referentially-complete subset as a SQL package
-  GET  /docs         interactive API documentation (Swagger UI)
+  GET  /healthz                  liveness probe
+  GET  /api/tables               describe the exportable source schema
+  POST /api/export               export a referentially-complete subset as a SQL package
+  POST /api/compatibility/check  check whether a target schema can host public
+  GET  /docs                     interactive API documentation (Swagger UI)
 """
 
 from __future__ import annotations
@@ -17,11 +18,13 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
+from compatibility import CompatibilityRequest, compare_schema, parse_target
 from exporter import (
     ALLOWED_TYPES,
     MAX_ROWS,
     MAX_TABLES,
     ExportError,
+    Schema,
     compute_closure,
     load_schema,
     render_sql,
@@ -35,7 +38,7 @@ DATABASE_URL = os.environ.get(
 
 app = FastAPI(
     title="pg-subset-exporter",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Export a referentially-complete row subset from a PostgreSQL source "
         "(schema `public`, up to 6 plain tables) as a self-contained SQL package. "
@@ -43,7 +46,10 @@ app = FastAPI(
         "transaction, so the export is a single committed snapshot and never blocks "
         "source writes. If the closure exceeds 1000 rows, a reference cannot be "
         "resolved, or a read fails, the whole export fails and no partial package "
-        "is produced."
+        "is produced. `POST /api/compatibility/check` compares the live source "
+        "schema against a candidate target schema (same JSON shape as "
+        "`GET /api/tables`) and reports blocking incompatibilities and warnings "
+        "with foreign-key dependency paths."
     ),
 )
 
@@ -157,3 +163,67 @@ def export_subset(req: ExportRequest) -> Response:
             "Cache-Control": "no-store",
         },
     )
+
+
+def _snapshot_schema() -> tuple[Schema, dict]:
+    """Read and validate the source schema inside one read-only snapshot.
+
+    Same snapshot discipline as an export: schema metadata comes from a
+    single committed snapshot (REPEATABLE READ READ ONLY), so the
+    compatibility verdict is consistent and never blocks source writers.
+    """
+    with _connect() as conn:
+        conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        conn.read_only = True
+        schema = load_schema(conn)
+        validate_schema(schema)
+        if conn.info.server_version >= 130000:
+            snap_sql = "SELECT now(), current_setting('transaction_isolation'), pg_current_snapshot()::text"
+        else:
+            snap_sql = "SELECT now(), current_setting('transaction_isolation'), NULL"
+        with conn.cursor() as cur:
+            cur.execute(snap_sql)
+            snapshot_ts, isolation, tx_snapshot = cur.fetchone()
+    return schema, {
+        "time": snapshot_ts.isoformat() if snapshot_ts else None,
+        "isolation": f"{isolation}, read only",
+        "tx_snapshot": tx_snapshot,
+    }
+
+
+@app.post("/api/compatibility/check")
+def check_compatibility(req: CompatibilityRequest) -> dict:
+    """Check whether a candidate target schema can host the current public schema.
+
+    Submit the target schema as JSON in the same shape that `GET /api/tables`
+    returns (its response can be edited and posted back). The source schema is
+    read inside the same kind of read-only snapshot transaction used for
+    exports, then tables, column types/nullability, primary keys, unique
+    constraints and foreign keys are compared. Missing or narrowed items are
+    reported; constraints affected along foreign-key dependencies are marked
+    `blocking` (with dependency paths), all other differences are `warning`s.
+    A malformed target schema is rejected with 422.
+    """
+    try:
+        target = parse_target(req)  # before any DB work: bad input -> 422
+    except ExportError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    try:
+        schema, snapshot = _snapshot_schema()
+    except ExportError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    except psycopg.Error as exc:
+        raise HTTPException(500, f"source read failed: {type(exc).__name__}") from exc
+
+    issues = compare_schema(schema, target)
+    blocking = [i for i in issues if i.severity == "blocking"]
+    warnings = [i for i in issues if i.severity == "warning"]
+    return {
+        "compatible": not blocking,
+        "schema": "public",
+        "source_tables": len(schema.tables),
+        "target_tables": len(target.tables),
+        "snapshot": snapshot,
+        "summary": {"blocking": len(blocking), "warning": len(warnings)},
+        "issues": [i.to_dict() for i in blocking + warnings],
+    }

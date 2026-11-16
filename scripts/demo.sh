@@ -6,10 +6,13 @@
 #   4. restore of the SQL package into a fresh empty database (all FKs valid)
 #   5. concurrent writes during exports (source never blocked)
 #   6. failure semantics: missing seed, unknown table, >1000-row closure
+#   7. target compatibility check (POST /api/compatibility/check)
 #
 # Defaults target `docker compose up`; override with env vars for a local run:
 #   APP_URL=http://127.0.0.1:8000 PSQL=/path/to/psql DB_PORT=55432 \
 #   DB_PASSWORD=exporter WRITER_LOG=/tmp/writer.log ./scripts/demo.sh
+#
+# Requires: curl, grep, awk, python3 (step 8 edits the target-schema JSON).
 set -euo pipefail
 
 APP_URL=${APP_URL:-http://localhost:8000}
@@ -157,6 +160,71 @@ grep -qi 'exceeds' "$ARTIFACTS/err_toobig.json" || die "no limit explanation in 
 ! grep -q 'CREATE TABLE' "$ARTIFACTS/err_toobig.json" || die "partial SQL package leaked"
 psql_db "$DB_NAME" -c "DELETE FROM tasks WHERE id BETWEEN 900001 AND 901100;" >/dev/null
 ok "closure of 1100+ rows -> HTTP 422, error is JSON, no partial SQL package"
+
+step "8. target compatibility check (POST /api/compatibility/check)"
+# 8a. the live source schema posted back as the target -> compatible
+curl -sf "$APP_URL/api/tables" > "$ARTIFACTS/target_schema.json"
+code=$(curl -sS -o "$ARTIFACTS/compat_identical.json" -w '%{http_code}' \
+  -X POST "$APP_URL/api/compatibility/check" \
+  -H 'Content-Type: application/json' \
+  --data-binary @"$ARTIFACTS/target_schema.json")
+[ "$code" = 200 ] || die "compatibility check failed with HTTP $code: $(cat "$ARTIFACTS/compat_identical.json")"
+grep -q '"compatible": *true' "$ARTIFACTS/compat_identical.json" \
+  || die "identical target schema not reported compatible"
+grep -q '"blocking": *0' "$ARTIFACTS/compat_identical.json" \
+  || die "identical target schema reported blocking issues"
+ok "identical target schema -> compatible: true, 0 blocking / 0 warning"
+
+# 8b. a target that cannot host public: drop teams, narrow users.id to
+# smallint, force users.team_id NOT NULL, drop the unique constraint the
+# attachments FK depends on, and drop the attachments foreign key.
+python3 - "$ARTIFACTS/target_schema.json" > "$ARTIFACTS/target_broken.json" <<'PY'
+import json, sys
+
+doc = json.load(open(sys.argv[1]))
+tables = {t["name"]: t for t in doc["tables"]}
+
+del tables["teams"]                                   # missing table (breaks users<->teams FKs)
+
+def col(tbl, name):
+    return next(c for c in tables[tbl]["columns"] if c["name"] == name)
+
+col("users", "id")["type"] = "smallint"               # narrowed integer type
+col("users", "team_id")["not_null"] = True            # nullable -> NOT NULL
+tables["task_links"]["unique_constraints"] = []       # unique the attachments FK needs
+tables["attachments"]["foreign_keys"] = []            # FK dropped -> warning only
+
+doc["tables"] = list(tables.values())
+json.dump(doc, sys.stdout)
+PY
+code=$(curl -sS -o "$ARTIFACTS/compat_broken.json" -w '%{http_code}' \
+  -X POST "$APP_URL/api/compatibility/check" \
+  -H 'Content-Type: application/json' \
+  --data-binary @"$ARTIFACTS/target_broken.json")
+[ "$code" = 200 ] || die "compatibility check (broken target) failed with HTTP $code"
+grep -q '"compatible": *false' "$ARTIFACTS/compat_broken.json" \
+  || die "broken target still reported compatible"
+for cat in missing_table type_narrowed nullability_narrowed missing_unique_constraint missing_foreign_key; do
+  grep -q "\"$cat\"" "$ARTIFACTS/compat_broken.json" || die "issue category $cat not reported"
+done
+grep -q 'users(team_id) -> teams(id) \[users_team_fk\]' "$ARTIFACTS/compat_broken.json" \
+  || die "dependency path via users_team_fk missing"
+grep -q 'attachments(task_id, label) -> task_links(task_id, label) \[attachments_task_fk\]' \
+  "$ARTIFACTS/compat_broken.json" || die "dependency path via attachments_task_fk missing"
+ok "broken target -> compatible: false; blocking issues carry FK dependency paths, dropped FK is a warning"
+
+# 8c. malformed target schema -> 422
+code=$(curl -sS -o "$ARTIFACTS/compat_bad.json" -w '%{http_code}' \
+  -X POST "$APP_URL/api/compatibility/check" \
+  -H 'Content-Type: application/json' \
+  -d '{"tables": [{"name": "ghost", "columns": [{"name": "id", "type": "jsonb"}]}]}')
+[ "$code" = 422 ] || die "malformed target schema: expected 422, got $code"
+code=$(curl -sS -o "$ARTIFACTS/compat_bad2.json" -w '%{http_code}' \
+  -X POST "$APP_URL/api/compatibility/check" \
+  -H 'Content-Type: application/json' \
+  -d '{"tables": [{"name": "a", "primary_key": "missing_col", "columns": [{"name": "id", "type": "integer"}]}]}')
+[ "$code" = 422 ] || die "inconsistent target schema: expected 422, got $code"
+ok "malformed / inconsistent target schema -> HTTP 422"
 
 printf '\n\033[1mALL DEMO CHECKS PASSED\033[0m\n'
 echo "artifacts written to $ARTIFACTS/"

@@ -30,7 +30,7 @@ curl -OJ -X POST http://localhost:8000/api/export \
 | 服务   | 说明 |
 |--------|------|
 | `db`     | PostgreSQL 16 示例源库（`db/init.sql`：6 张表，含循环引用 users↔teams、自引用 tasks、可空复合外键 attachments→task_links） |
-| `app`    | FastAPI 导出服务（`/docs`、`/api/tables`、`/api/export`、`/healthz`） |
+| `app`    | FastAPI 导出服务（`/docs`、`/api/tables`、`/api/export`、`/api/compatibility/check`、`/healthz`） |
 | `writer` | 持续写入器：每 0.1–0.3s 提交一笔 INSERT/UPDATE，用于演示导出期间源端并发改写不被阻断 |
 
 ## 导出语义
@@ -62,14 +62,45 @@ curl -OJ -X POST http://localhost:8000/api/export \
 - `GET /api/tables` — 查看可导出的表、列、主键、唯一与外键约束。
 - `POST /api/export` — 请求体 `{"table": "<种子表>", "pks": [<主键>...]}`；
   成功返回 `application/sql` 附件下载；失败返回 JSON 错误且不产出任何 SQL。
+- `POST /api/compatibility/check` — 目标库兼容性检查（见下节）。
 - `GET /docs` — Swagger UI 交互文档。
+
+## 目标库兼容性检查
+
+迁移工程师在导出关联子集前，可先确认目标库能否承接当前 `public` schema：
+
+```bash
+# 目标 schema 与 GET /api/tables 响应同构——可直接取其输出改改后提交
+curl -s http://localhost:8000/api/tables > target.json
+# ... 按目标库实际情况编辑 target.json ...
+curl -s -X POST http://localhost:8000/api/compatibility/check \
+  -H 'Content-Type: application/json' --data-binary @target.json | jq
+```
+
+服务在与导出相同的 `REPEATABLE READ READ ONLY` 快照事务中读取源结构，
+逐项比较表、列类型/可空性、主键、唯一约束和外键，返回
+`compatible`（无 blocking 即为 true）、`summary` 与 `issues`
+（每条含 `severity`/`category`/`reason`/`dependency_paths`）：
+
+- **blocking**（目标无法承接）：缺表、缺列、列类型缩窄或不兼容
+  （`bigint→integer→smallint` 缩窄、`text→integer`、参与外键的列
+  `integer→text`，PostgreSQL 无法跨 integer/text 建外键）、可空性缩窄
+  （源可空而目标 `NOT NULL`）、主键缺失或不一致、被外键引用的唯一约束缺失。
+  影响沿源库外键依赖图传播，每条 blocking 附带 `dependency_paths`，如
+  `users(team_id) -> teams(id) [users_team_fk]`。
+- **warning**（数据可装载但保障减弱或可能拒数）：未被外键引用的唯一约束缺失、
+  外键缺失、普通列 `integer→text`、目标额外定义的 NOT NULL 列/唯一约束/外键。
+
+目标 JSON 格式错误（缺字段、未知列类型、重复表/列、主键或唯一约束引用
+本表不存在的列、外键列数不匹配等）返回 `422`；目标文档中引用缺失的
+表/列不算格式错误——那正是比较要报告的缺失项。
 
 ## 本地开发（不用 Docker）
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r app/requirements.txt
-cd app && python -m unittest test_exporter -v   # 核心逻辑单元测试（无需数据库）
+cd app && python -m unittest test_exporter test_compatibility test_api -v   # 单元 + API 测试（无需数据库）
 DATABASE_URL=postgresql://exporter:exporter@localhost:5432/source \
   uvicorn main:app --port 8000
 ```
